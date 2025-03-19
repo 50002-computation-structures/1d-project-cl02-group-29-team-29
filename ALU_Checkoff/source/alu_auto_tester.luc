@@ -1,0 +1,404 @@
+module alu_auto_tester (
+    input clk,  // Main clock (e.g., 10 MHz)
+    input rst,  // Reset button
+    input io_button[5], // Buttons
+    input io_dip[3][8],
+    output io_led[3][8], // LEDs
+    output io_segment[8],
+    output io_select[4],
+    output led[8]
+) {
+    sig slow_clock
+    sig current_inputs[70] //To connect to each ROM readout
+    sig current_output[32]
+    sig current_z
+    sig current_v
+    sig current_n
+
+    sig correct_answer[35]
+    sig correct_z
+    sig correct_v
+    sig correct_n
+
+    const SIZE = 32
+    const SLOW_CLOCK_DEFAULT_SPEED = $is_sim() ? 8 : 24 // put 8  for sim, 24 for hardware
+    const CLK_FREQ = $is_sim() ? 1000 : 10000000
+
+    //Create ROM for test cases (ALUFN, A, B)
+    const INPUTS = {
+        // ADD: Addition edge cases
+        c{6b000000, 32b00000000000000000000000000000000, 32b00000000000000000000000000000000},  // 0 + 0 = 0
+        c{6b000000, 32b01111111111111111111111111111111, 32b00000000000000000000000000000001},  // INT_MAX + 1 (overflow)
+        c{6b000000, 32b10000000000000000000000000000000, 32b11111111111111111111111111111111},  // INT_MIN + (-1) (no overflow)
+        c{6b000000, 32b10000000000000000000000000000000, 32b10000000000000000000000000000000},  // INT_MIN + INT_MIN (overflow)
+
+        // SUB: Subtracting same values, max negative, and checking underflow
+        c{6b000001, 32b00000000000000000000000000000000, 32b00000000000000000000000000000000},  // 0 - 0 = 0
+        c{6b000001, 32b01111111111111111111111111111111, 32b00000000000000000000000000000001},  // INT_MAX - 1 = INT_MAX - 1
+        c{6b000001, 32b10000000000000000000000000000000, 32b00000000000000000000000000000001},  // INT_MIN - 1 (underflow)
+        c{6b000001, 32b10000000000000000000000000000000, 32b01111111111111111111111111111111},  // INT_MIN - INT_MAX (extreme underflow)
+    
+        // MUL: Multiplication edge cases
+        c{6b000010, 32b00000000000000000000000000000000, 32b00000000000000000000000000000000},  // 0 * 0 = 0
+        c{6b000010, 32b00000000000000000000000000000001, 32b01111111111111111111111111111111},  // 1 * INT_MAX = INT_MAX
+        c{6b000010, 32b10000000000000000000000000000000, 32b00000000000000000000000000000001},  // INT_MIN * 1 = INT_MIN
+        c{6b000010, 32b10000000000000000000000000000000, 32b11111111111111111111111111111111},  // INT_MIN * -1 = INT_MIN
+    
+        // AND: Bitwise AND tests
+        c{6b011000, 32b00000000000000000000000000000000, 32b11111111111111111111111111111111},  // 0 & -1 = 0
+        c{6b011000, 32b10101010101010101010101010101010, 32b01010101010101010101010101010101},  // Alternating bits = all 0's
+        c{6b011000, 32b11111111111111111111111111111111, 32b11111111111111111111111111111111},  // -1 & -1 = -1
+        c{6b011000, 32b00001111000011110000111100001111, 32b11110000111100001111000011110000},  // Interleaved patterns = all 0's
+    
+        // OR: Bitwise OR tests
+        c{6b011110, 32b00000000000000000000000000000000, 32b00000000000000000000000000000000},  // 0 | 0 = 0
+        c{6b011110, 32b10101010101010101010101010101010, 32b01010101010101010101010101010101},  // Alternating bits = all 1's
+        c{6b011110, 32b11111111111111111111111111111111, 32b00000000000000000000000000000000},  // -1 | 0 = -1
+        c{6b011110, 32b00001111000011110000111100001111, 32b11110000111100001111000011110000},  // Interleaved patterns = all 1's
+    
+        // XOR: Bitwise XOR tests
+        c{6b010110, 32b00000000000000000000000000000000, 32b11111111111111111111111111111111},  // 0 ^ -1 = -1
+        c{6b010110, 32b10101010101010101010101010101010, 32b01010101010101010101010101010101},  // Alternating bits (full flip) = all 1's
+        c{6b010110, 32b11111111111111111111111111111111, 32b11111111111111111111111111111111},  // -1 ^ -1 = all 0's
+        c{6b010110, 32b00001111000011110000111100001111, 32b11110000111100001111000011110000},  // Interleaved patterns = all 1's
+    
+        // "A" (Pass-through A)
+        c{6b011010, 32b00000000000000000000000000000000, 32b11111111111111111111111111111111},  // Pass 0
+        c{6b011010, 32b01111111111111111111111111111111, 32b00000000000000000000000000000001},  // Pass INT_MAX
+        c{6b011010, 32b10000000000000000000000000000000, 32b00000000000000000000000000000001},  // Pass INT_MIN
+        c{6b011010, 32b11111111111111111111111111111111, 32b00000000000000000000000000000000},  // Pass -1
+    
+        // SHL: Shift left logical
+        c{6b100000, 32b00000000000000000000000000000001, 32b00000000000000000000000000000001},  // 1 << 1 = 2
+        c{6b100000, 32b00000000000000000000000000000001, 32b00000000000000000000000000001111},  // 1 << 15
+        c{6b100000, 32b00000000000000000000000000000001, 32b00000000000000000000000000011111},  // 1 << 31
+        c{6b100000, 32b10000000000000000000000000000000, 32b00000000000000000000000000000001},  // INT_MIN << 1 (overflow)
+    
+        // SHR: Shift right logical
+        c{6b100001, 32b10000000000000000000000000000000, 32b00000000000000000000000000000001},  // INT_MIN >> 1
+        c{6b100001, 32b00000000000000000000000000000001, 32b00000000000000000000000000000001},  // 1 >> 1 = 0
+        c{6b100001, 32b01111111111111111111111111111111, 32b00000000000000000000000000001111},  // INT_MAX >> 15
+        c{6b100001, 32b11111111111111111111111111111111, 32b00000000000000000000000000011111},  // -1 >> 31 = 1
+    
+        // SRA: Shift right arithmetic
+        c{6b100011, 32b10000000000000000000000000000000, 32b00000000000000000000000000000001},  // INT_MIN >> 1 (keeps sign)
+        c{6b100011, 32b01111111111111111111111111111111, 32b00000000000000000000000000001111},  // INT_MAX >> 15
+        c{6b100011, 32b11111111111111111111111111111111, 32b00000000000000000000000000011111},  // -1 >> 31 (remains -1)
+        c{6b100011, 32b00000000000000000000000000000001, 32b00000000000000000000000000000001},  // 1 >> 1 = 0
+    
+        // CMPEQ: Compare equal
+        c{6b110011, 32b00000000000000000000000000000000, 32b00000000000000000000000000000000},  // 0 == 0 → 1
+        c{6b110011, 32b01111111111111111111111111111111, 32b01111111111111111111111111111111},  // INT_MAX == INT_MAX → 1
+        c{6b110011, 32b10000000000000000000000000000000, 32b00000000000000000000000000000001},  // INT_MIN == 1 → 0
+        c{6b110011, 32b11111111111111111111111111111111, 32b11111111111111111111111111111110}   // -1 == -2 → 0
+    }
+
+    
+    //list of corresponding correct answers
+    const ANSWER = {
+        // ADD: Addition edge cases
+        c{32b00000000000000000000000000000000, 1b1, 1b0, 1b0},  // 0 + 0 = 0 (Z=1, V=0, N=0)
+        c{32b10000000000000000000000000000000, 1b0, 1b1, 1b1},  // INT_MAX + 1 (overflow) (Z=0, V=1, N=1)
+        c{32b01111111111111111111111111111111, 1b0, 1b0, 1b0},  // INT_MIN + (-1) (no overflow) (Z=0, V=0, N=0)
+        c{32b00000000000000000000000000000000, 1b1, 1b1, 1b0},  // INT_MIN + INT_MIN (overflow) (Z=1, V=1, N=0)
+        
+        // SUB: Subtracting same values, max negative, and checking underflow
+        c{32b00000000000000000000000000000000, 1b1, 1b0, 1b0},  // 0 - 0 = 0 (Z=1, V=0, N=0)
+        c{32b01111111111111111111111111111110, 1b0, 1b0, 1b0},  // INT_MAX - 1 = INT_MAX - 1 (Z=0, V=0, N=0)
+        c{32b01111111111111111111111111111111, 1b0, 1b1, 1b0},  // INT_MIN - 1 (underflow) (Z=0, V=1, N=0)
+        c{32b00000000000000000000000000000001, 1b0, 1b1, 1b0},  // INT_MIN - INT_MAX (extreme underflow) (Z=0, V=1, N=0)
+    
+        // MUL: Multiplication edge cases
+        c{32b00000000000000000000000000000000, 1b1, 1b0, 1b0},  // 0 * 0 = 0 (Z=1, V=0, N=0)
+        c{32b01111111111111111111111111111111, 1b0, 1b0, 1b0},  // 1 * INT_MAX = INT_MAX (Z=0, V=0, N=0)
+        c{32b10000000000000000000000000000000, 1b0, 1b0, 1b1},  // INT_MIN * 1 = INT_MIN (Z=0, V=0, N=1)
+        c{32b10000000000000000000000000000000, 1b0, 1b1, 1b1},  // INT_MIN * -1 = INT_MIN (Z=0, V=1, N=1)
+    
+        // AND: Bitwise AND tests
+        c{32b00000000000000000000000000000000, 1b1, 1b0, 1b0},  // 0 & -1 = 0 (Z=1, V=0, N=0)
+        c{32b00000000000000000000000000000000, 1b1, 1b0, 1b0},  // Alternating bits = all 0's (Z=1, V=0, N=0)
+        c{32b11111111111111111111111111111111, 1b0, 1b0, 1b1},  // -1 & -1 = -1 (Z=0, V=0, N=1)
+        c{32b00000000000000000000000000000000, 1b1, 1b0, 1b0},  // Interleaved patterns = all 0's (Z=1, V=0, N=0)
+    
+        // OR: Bitwise OR tests
+        c{32b00000000000000000000000000000000, 1b1, 1b0, 1b0},  // 0 | 0 = 0 (Z=1, V=0, N=0)
+        c{32b11111111111111111111111111111111, 1b0, 1b0, 1b1},  // Alternating bits = all 1's (Z=0, V=0, N=1)
+        c{32b11111111111111111111111111111111, 1b0, 1b0, 1b1},  // -1 | 0 = -1 (Z=0, V=0, N=1)
+        c{32b11111111111111111111111111111111, 1b0, 1b0, 1b1},  // Interleaved patterns = all 1's (Z=0, V=0, N=1)
+    
+        // XOR: Expected results
+        c{32b11111111111111111111111111111111, 1b0, 1b0, 1b1},  // 0 ^ -1 = -1 (Z=0, V=0, N=1)
+        c{32b11111111111111111111111111111111, 1b0, 1b0, 1b1},  // Alternating bits (full flip) (Z=0, V=0, N=1)
+        c{32b00000000000000000000000000000000, 1b1, 1b0, 1b0},  // -1 ^ -1 = 0 (Z=1, V=0, N=0)
+        c{32b11111111111111111111111111111111, 1b0, 1b0, 1b1},  // Interleaved patterns (Z=0, V=0, N=1)
+        
+        // "A": Expected results
+        c{32b00000000000000000000000000000000, 1b1, 1b0, 1b0},  // A input 0 = A output 0, z = 1
+        c{32b01111111111111111111111111111111, 1b0, 1b0, 1b0},  // Pass MAX
+        c{32b10000000000000000000000000000000, 1b0, 1b0, 1b1},  // Pass MIN
+        c{32b11111111111111111111111111111111, 1b0, 1b0, 1b1},  // Pass -1
+    
+        // SHL: Shift left logical
+        c{32b00000000000000000000000000000010, 1b0, 1b0, 1b0},  // 1 << 1 = 2 (Z=0, V=0, N=0)
+        c{32b00000000000000001000000000000000, 1b0, 1b0, 1b1},  // 1 << 15 (Z=0, V=0, N=1)
+        c{32b10000000000000000000000000000000, 1b0, 1b0, 1b1},  // 1 << 31 (Z=0, V=0, N=1)
+        c{32b00000000000000000000000000000000, 1b1, 1b1, 1b0},  // INT_MIN << 1 (overflow) (Z=1, V=1, N=0)
+    
+        // SHR: Shift right logical
+        c{32b01000000000000000000000000000000, 1b0, 1b0, 1b0},  // INT_MIN >> 1 (Z=0, V=0, N=0)
+        c{32b00000000000000000000000000000000, 1b1, 1b0, 1b0},  // 1 >> 1 = 0 (Z=1, V=0, N=0)
+        c{32b00000000000000001111111111111111, 1b0, 1b0, 1b0},  // INT_MAX >> 15 (Z=0, V=0, N=0)
+        c{32b00000000000000000000000000000001, 1b0, 1b0, 1b0},  // -1 >> 31 = 1 (Z=0, V=0, N=0)
+    
+        // SRA: Expected results
+        c{32b11000000000000000000000000000000, 1b0, 1b0, 1b1},  // INT_MIN >> 1 (sign extended)
+        c{32b00000000000000001111111111111111, 1b0, 1b0, 1b0},  // INT_MAX >> 15 = 0xFFFF
+        c{32b11111111111111111111111111111111, 1b0, 1b0, 1b1},  // -1 >> 31 = -1 (sign extended)
+        c{32b00000000000000000000000000000000, 1b1, 1b0, 1b0},  // 1 >> 1 = 0
+    
+        // CMPEQ: Expected results
+        c{32b00000000000000000000000000000001, 1b1, 1b0, 1b0},  // 0 == 0 → 1 (Z=1, V=0, N=0)
+        c{32b00000000000000000000000000000001, 1b1, 1b0, 1b0},  // INT_MAX == INT_MAX → 1 (Z=1, V=0, N=0)
+        c{32b00000000000000000000000000000000, 1b1, 1b0, 1b0},  // INT_MIN == 1 → 0 (Z=0, V=0, N=0)
+        c{32b00000000000000000000000000000000, 1b1, 1b0, 1b0}  // -1 == -2 → 0 (Z=0, V=0, N=0)
+    }
+    
+    enum States{
+        IDLE,
+        AUTO_RUN,
+        NEXT,
+        BACK,
+        HALT
+    }
+
+    // Slow clock counter
+    .clk(clk) {
+        edge_detector slow_clock_edge(#RISE(1), #FALL(0))
+        edge_detector io_button_edge[5](#RISE(5x{{1}}), #FALL(5x{{0}}))
+        button_conditioner io_button_cond[5](#CLK_FREQ(5x{{CLK_FREQ}}))
+        .rst(rst){
+            dff clock_counter[SIZE]
+            dff states[$width(States)](#INIT(States.IDLE)) //reset everything back to idle
+            dff slow_clock_enable(#INIT(0))
+            dff test_index[8](#INIT(0))
+            dff result_checker[1](#INIT(1))
+            dff high_16[16]      // Stores lower 16 bits of A
+            dff low_16[16]       // Stores upper 16 bits of A
+            dff manual_high_16[16]
+            dff manual_low_16[16]
+            dff toggle_display[1](#INIT(0)) //Manual toggling of output bits viewing (upper and lower 16 bits)
+            dff display_toggle_counter[4](#INIT(0))  // Initialize the toggle counter (3-bit counter)
+        }
+    }
+    
+    alu alu
+
+    always {
+        //default connections
+        alu.a = 0
+        alu.b = 0
+        alu.alufn = 0
+        io_led = 3x{{8h0}}
+        io_segment = 0
+        io_select = 4hF
+        led = 0
+        current_inputs = 0
+        current_z = 0
+        current_v = 0
+        current_n = 0
+        
+        //Handle button debouncing
+        io_button_cond.in = io_button
+        io_button_edge.in = io_button_cond.out
+        
+        //Connect all dffs
+        //Slow clock creation
+        clock_counter.d = clock_counter.q + 1
+        states.d = states.q
+        slow_clock_enable.d = slow_clock_enable.q
+        
+        //Index through test cases
+        test_index.d = test_index.q
+        
+        //Hold output values for high-side 16bits and low-side 16bits
+        high_16.d = high_16.q
+        low_16.d = low_16.q
+        manual_high_16.d = manual_high_16.q
+        manual_low_16.d = manual_low_16.q
+        
+        //To toggle between lower 16bits and higher 16bits
+        display_toggle_counter.d = display_toggle_counter.q
+        
+        //Check answer reg
+        result_checker.d = result_checker.q
+        
+        // signal connection for slow clock
+        slow_clock = clock_counter.q[SLOW_CLOCK_DEFAULT_SPEED] // pointed based on the bit of the counter
+        
+        //assign input to clock edge detector depending on value of slow_clock_enable
+        case (slow_clock_enable.q){
+            0:
+                slow_clock_edge.in = 0 // always don't increment or decrement
+            1: 
+                slow_clock_edge.in = slow_clock 
+            default:
+                slow_clock_edge.in = 0
+        }
+        
+        case(states.q){
+            States.IDLE:
+                if(io_dip[2][7]){
+                    slow_clock_enable.d = 1
+                    states.d = States.AUTO_RUN
+                }
+                else if(io_button_edge.out[0]){
+                    toggle_display.d = 1
+                }
+                else if(io_button_edge.out[2]){
+                    toggle_display.d = 0
+                }
+            else if(io_button-ed)
+                else if(io_button_edge.out[3]){
+                    states.d = States.BACK
+                }
+                else if(io_button_edge.out[4]){
+                    states.d = States.NEXT
+                }
+            States.AUTO_RUN:
+                if (result_checker.q == 0){     //stop if encounter wrong output
+                    if (slow_clock_enable.q){
+                        states.d = States.HALT
+                    }
+                }
+                else if(slow_clock_edge.out) {
+                    if(~io_dip[2][7]){
+                        states.d = States.HALT
+                    }
+                    else if(display_toggle_counter.q < 4) {
+                        display_toggle_counter.d = display_toggle_counter.q + 1
+                    }
+                    else {
+                        states.d = States.NEXT     // After 4 toggles, move to the next state
+                    }
+                }
+                else if(io_button_edge.out[1]){
+                    slow_clock_enable.d = 0
+                    states.d = States.IDLE
+                }
+            States.NEXT:
+                if(test_index.q + 1 >= d44){
+                    test_index.d = 44
+                }
+                else{
+                    test_index.d = test_index.q + 1
+                }
+                display_toggle_counter.d = 0     // Reset the toggle counter for the next cycle
+                if(slow_clock_enable.q == 0){
+                    states.d = States.IDLE
+                }
+                else if(slow_clock_enable.q == 1){
+                    states.d = States.AUTO_RUN
+                }
+            States.BACK:
+                if(test_index.q - 1 <= d0){
+                    test_index.d = 0
+                }
+                else{
+                    test_index.d = test_index.q - 1
+                }
+                if(slow_clock_enable.q == 0){
+                    states.d = States.IDLE
+                }
+                else if(slow_clock_enable.q == 1){
+                    states.d = States.AUTO_RUN
+                }
+            States.HALT:
+                slow_clock_enable.d = 0
+                states.d = States.IDLE
+        }
+
+        //Compute ALU
+        if(states.q == States.IDLE){
+            current_inputs = INPUTS[test_index.q]
+            alu.alufn = current_inputs[69:64]
+            alu.a = current_inputs[63:32]
+            alu.b = current_inputs[31:0]
+            high_16.d = alu.out[31:16]
+            low_16.d = alu.out[15:0]
+        }
+        else{
+            current_inputs = INPUTS[test_index.q]
+            alu.alufn = current_inputs[69:64]
+            alu.a = current_inputs[63:32]
+            alu.b = current_inputs[31:0]
+            high_16.d = alu.out[31:16]
+            low_16.d = alu.out[15:0]
+        }
+
+        
+        //simulation of 'wrong' answer
+        if(io_dip[2][6]){
+            current_output = ~alu.out //check if first dip button is being pressed down. if yes, invert the output and v
+            current_v = ~alu.v
+        }
+        else{
+            current_output = alu.out
+            current_z = alu.z
+            current_v = alu.v
+            current_n = alu.n
+        }
+        
+        //FETCHING CORRECT OUTPUTS
+        correct_answer = ANSWER[test_index.q]
+        correct_z = correct_answer[2]
+        correct_v = correct_answer[1]
+        correct_n = correct_answer[0]
+        
+        //CHECKING IF OUTPUT IS CORRECT
+        if ((correct_answer[34:3] == current_output) | (correct_v & current_v)){                // either result is correct, or overflow.
+            if ((current_inputs[69:64] == b000000)| (current_inputs[69:64] == b000001)){        // additional check for add and sub.
+                if ((correct_z == alu.z & correct_n == alu.n) | (correct_v == current_v)){      // either z and n values correct, 
+                    result_checker.d = 1                                                              // or overflow happens and alu correctly detects it
+                    led[6] = 1
+                }
+                else{ 
+                    result_checker.d = 0
+                    led[7] = 1
+                }
+            }
+            else{
+                result_checker.d = 1  //for other operations, no need additional check
+                led[6] = 1
+            }
+        }
+        else{
+            result_checker.d = 0      //wrong (incorrect value AND not overflow)
+            led[7] = 1
+        }
+
+        //Display on LEDs
+        if(states.q == States.AUTO_RUN){
+            if(display_toggle_counter.q < 2) {
+                io_led[0] = low_16.q[7:0]
+                io_led[1] = low_16.q[15:8]
+            }
+            else if(display_toggle_counter.q < 4){
+                io_led[0] = high_16.q[7:0]
+                io_led[1] = high_16.q[15:8]
+            }
+        }
+        else if(states.q == States.IDLE){
+            if(toggle_display.q == 1 && states.q == States.IDLE){
+                io_led[0] = high_16.q[7:0]
+                io_led[1] = high_16.q[15:8]
+            }
+            else if(toggle_display.q == 0 && states.q == States.IDLE){
+                io_led[0] = low_16.q[7:0]
+                io_led[1] = low_16.q[15:8]
+            }
+        }
+        
+        io_led[2] = test_index.q
+        //led = c{6b0,toggle_display.q, slow_clock}
+    }
+}
